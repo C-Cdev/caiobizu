@@ -1,97 +1,118 @@
-// server.js - Configurado para Produção
+// server.js - Configurado para Produção com PostgreSQL
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
+const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const session = require('express-session');
 const path = require('path');
 
 // Configurar o app Express
 const app = express();
-const PORT = process.env.PORT || 3000; // Railway define a porta automaticamente
+const PORT = process.env.PORT || 3000;
 
 // Middlewares
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static('public'));
 
-// Configurar sessões - usando variável de ambiente para produção
+// Configurar sessões
 app.use(session({
     secret: process.env.SESSION_SECRET || 'meu-bizu-secreto-123',
     resave: false,
     saveUninitialized: false,
     cookie: { 
-        secure: false, // Railway usa HTTPS automático
+        secure: false,
         maxAge: 24 * 60 * 60 * 1000
     }
 }));
 
-// Conectar com banco SQLite
-const dbPath = process.env.DATABASE_URL || './database/database.db';
-const db = new sqlite3.Database(dbPath, (err) => {
-    if (err) {
-        console.error('Erro ao conectar com banco:', err.message);
-    } else {
-        console.log('✅ Conectado ao banco SQLite');
-        criarTabelas();
-    }
+// Conectar com PostgreSQL
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.NODE_ENV === 'production' ? { 
+        rejectUnauthorized: false 
+    } : false
 });
 
+// Função helper para queries
+async function query(text, params = []) {
+    const client = await pool.connect();
+    try {
+        const result = await client.query(text, params);
+        return result;
+    } catch (error) {
+        console.error('Database error:', error);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+// Testar conexão e criar tabelas
+async function inicializarBanco() {
+    try {
+        await pool.query('SELECT NOW()');
+        console.log('✅ Conectado ao banco PostgreSQL');
+        await criarTabelas();
+    } catch (error) {
+        console.error('Erro ao conectar com banco:', error.message);
+    }
+}
+
 // Função para criar as tabelas se não existirem
-function criarTabelas() {
-    // Tabela de usuários
-    db.run(`
-        CREATE TABLE IF NOT EXISTS usuarios (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nome TEXT NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            senha TEXT NOT NULL,
-            data_criacao DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    `, (err) => {
-        if (err) console.error('Erro ao criar tabela usuarios:', err);
-        else console.log('✅ Tabela usuarios criada/verificada');
-    });
+async function criarTabelas() {
+    try {
+        // Tabela de usuários
+        await query(`
+            CREATE TABLE IF NOT EXISTS usuarios (
+                id SERIAL PRIMARY KEY,
+                nome VARCHAR(255) NOT NULL,
+                email VARCHAR(255) UNIQUE NOT NULL,
+                senha VARCHAR(255) NOT NULL,
+                data_criacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+        console.log('✅ Tabela usuarios criada/verificada');
 
-    // Tabela de categorias
-    db.run(`
-        CREATE TABLE IF NOT EXISTS categorias (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nome TEXT UNIQUE NOT NULL
-        )
-    `, (err) => {
-        if (err) console.error('Erro ao criar tabela categorias:', err);
-        else {
-            console.log('✅ Tabela categorias criada/verificada');
-            inserirCategoriasPadrao();
-        }
-    });
+        // Tabela de categorias
+        await query(`
+            CREATE TABLE IF NOT EXISTS categorias (
+                id SERIAL PRIMARY KEY,
+                nome VARCHAR(255) UNIQUE NOT NULL
+            )
+        `);
+        console.log('✅ Tabela categorias criada/verificada');
 
-    // Tabela de bizus
-    db.run(`
-        CREATE TABLE IF NOT EXISTS bizus (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            titulo TEXT NOT NULL,
-            conteudo TEXT NOT NULL,
-            categoria_id INTEGER,
-            autor_id INTEGER NOT NULL,
-            data_criacao DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (categoria_id) REFERENCES categorias(id),
-            FOREIGN KEY (autor_id) REFERENCES usuarios(id)
-        )
-    `, (err) => {
-        if (err) console.error('Erro ao criar tabela bizus:', err);
-        else console.log('✅ Tabela bizus criada/verificada');
-    });
+        // Tabela de bizus
+        await query(`
+            CREATE TABLE IF NOT EXISTS bizus (
+                id SERIAL PRIMARY KEY,
+                titulo VARCHAR(255) NOT NULL,
+                conteudo TEXT NOT NULL,
+                categoria_id INTEGER REFERENCES categorias(id),
+                autor_id INTEGER NOT NULL REFERENCES usuarios(id),
+                data_criacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+        console.log('✅ Tabela bizus criada/verificada');
+
+        await inserirCategoriasPadrao();
+    } catch (error) {
+        console.error('Erro ao criar tabelas:', error);
+    }
 }
 
 // Inserir categorias padrão
-function inserirCategoriasPadrao() {
+async function inserirCategoriasPadrao() {
     const categorias = ['Matemática', 'Física', 'Química', 'Biologia', 'História', 'Geografia', 'Português', 'Inglês', 'Filosofia', 'Geral'];
     
-    categorias.forEach(categoria => {
-        db.run('INSERT OR IGNORE INTO categorias (nome) VALUES (?)', [categoria]);
-    });
-    console.log('✅ Categorias padrão inseridas');
+    try {
+        for (const categoria of categorias) {
+            await query('INSERT INTO categorias (nome) VALUES ($1) ON CONFLICT (nome) DO NOTHING', [categoria]);
+        }
+        console.log('✅ Categorias padrão inseridas');
+    } catch (error) {
+        console.error('Erro ao inserir categorias:', error);
+    }
 }
 
 // Middleware para verificar se usuário está logado
@@ -131,42 +152,38 @@ app.post('/api/register', async (req, res) => {
     try {
         const senhaCriptografada = await bcrypt.hash(senha, 10);
 
-        db.run(
-            'INSERT INTO usuarios (nome, email, senha) VALUES (?, ?, ?)',
-            [nome, email, senhaCriptografada],
-            function(err) {
-                if (err) {
-                    if (err.code === 'SQLITE_CONSTRAINT') {
-                        res.status(400).json({ erro: 'Email já está em uso' });
-                    } else {
-                        res.status(500).json({ erro: 'Erro interno do servidor' });
-                    }
-                } else {
-                    res.json({ 
-                        sucesso: true, 
-                        mensagem: 'Usuário registrado com sucesso!',
-                        userId: this.lastID 
-                    });
-                }
-            }
+        const result = await query(
+            'INSERT INTO usuarios (nome, email, senha) VALUES ($1, $2, $3) RETURNING id',
+            [nome, email, senhaCriptografada]
         );
+
+        res.json({ 
+            sucesso: true, 
+            mensagem: 'Usuário registrado com sucesso!',
+            userId: result.rows[0].id
+        });
+
     } catch (error) {
-        res.status(500).json({ erro: 'Erro interno do servidor' });
+        if (error.constraint === 'usuarios_email_key') {
+            res.status(400).json({ erro: 'Email já está em uso' });
+        } else {
+            console.error('Erro no registro:', error);
+            res.status(500).json({ erro: 'Erro interno do servidor' });
+        }
     }
 });
 
 // Login do usuário
-app.post('/api/login', (req, res) => {
+app.post('/api/login', async (req, res) => {
     const { email, senha } = req.body;
 
     if (!email || !senha) {
         return res.status(400).json({ erro: 'Email e senha são obrigatórios' });
     }
 
-    db.get('SELECT * FROM usuarios WHERE email = ?', [email], async (err, usuario) => {
-        if (err) {
-            return res.status(500).json({ erro: 'Erro interno do servidor' });
-        }
+    try {
+        const result = await query('SELECT * FROM usuarios WHERE email = $1', [email]);
+        const usuario = result.rows[0];
 
         if (!usuario) {
             return res.status(401).json({ erro: 'Email ou senha incorretos' });
@@ -186,7 +203,11 @@ app.post('/api/login', (req, res) => {
             mensagem: 'Login realizado com sucesso!',
             usuario: { id: usuario.id, nome: usuario.nome, email: usuario.email }
         });
-    });
+
+    } catch (error) {
+        console.error('Erro no login:', error);
+        res.status(500).json({ erro: 'Erro interno do servidor' });
+    }
 });
 
 // Logout
@@ -202,9 +223,9 @@ app.post('/api/logout', (req, res) => {
 // ==================== ROTAS DOS BIZUS ====================
 
 // Listar todos os bizus (com filtro opcional por categoria)
-app.get('/api/bizus', (req, res) => {
+app.get('/api/bizus', async (req, res) => {
     const categoria = req.query.categoria;
-    let query = `
+    let queryText = `
         SELECT b.*, u.nome as autor_nome, c.nome as categoria_nome 
         FROM bizus b 
         JOIN usuarios u ON b.autor_id = u.id 
@@ -213,23 +234,23 @@ app.get('/api/bizus', (req, res) => {
     let params = [];
 
     if (categoria && categoria !== 'todas') {
-        query += ' WHERE c.nome = ?';
+        queryText += ' WHERE c.nome = $1';
         params.push(categoria);
     }
 
-    query += ' ORDER BY b.data_criacao DESC';
+    queryText += ' ORDER BY b.data_criacao DESC';
 
-    db.all(query, params, (err, bizus) => {
-        if (err) {
-            console.error('Erro ao buscar bizus:', err);
-            return res.status(500).json({ erro: 'Erro interno do servidor' });
-        }
-        res.json(bizus);
-    });
+    try {
+        const result = await query(queryText, params);
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Erro ao buscar bizus:', error);
+        res.status(500).json({ erro: 'Erro interno do servidor' });
+    }
 });
 
 // Criar novo bizu (só para usuários logados)
-app.post('/api/bizus', verificarLogin, (req, res) => {
+app.post('/api/bizus', verificarLogin, async (req, res) => {
     const { titulo, conteudo, categoria } = req.body;
     const autorId = req.session.userId;
 
@@ -237,35 +258,40 @@ app.post('/api/bizus', verificarLogin, (req, res) => {
         return res.status(400).json({ erro: 'Título e conteúdo são obrigatórios' });
     }
 
-    db.get('SELECT id FROM categorias WHERE nome = ?', [categoria], (err, cat) => {
-        const categoriaId = cat ? cat.id : null;
+    try {
+        let categoriaId = null;
+        
+        if (categoria) {
+            const catResult = await query('SELECT id FROM categorias WHERE nome = $1', [categoria]);
+            categoriaId = catResult.rows[0]?.id || null;
+        }
 
-        db.run(
-            'INSERT INTO bizus (titulo, conteudo, categoria_id, autor_id) VALUES (?, ?, ?, ?)',
-            [titulo, conteudo, categoriaId, autorId],
-            function(err) {
-                if (err) {
-                    console.error('Erro ao criar bizu:', err);
-                    return res.status(500).json({ erro: 'Erro interno do servidor' });
-                }
-                res.json({ 
-                    sucesso: true, 
-                    mensagem: 'Bizu criado com sucesso!',
-                    bizuId: this.lastID 
-                });
-            }
+        const result = await query(
+            'INSERT INTO bizus (titulo, conteudo, categoria_id, autor_id) VALUES ($1, $2, $3, $4) RETURNING id',
+            [titulo, conteudo, categoriaId, autorId]
         );
-    });
+
+        res.json({ 
+            sucesso: true, 
+            mensagem: 'Bizu criado com sucesso!',
+            bizuId: result.rows[0].id
+        });
+
+    } catch (error) {
+        console.error('Erro ao criar bizu:', error);
+        res.status(500).json({ erro: 'Erro interno do servidor' });
+    }
 });
 
 // Listar categorias
-app.get('/api/categorias', (req, res) => {
-    db.all('SELECT * FROM categorias ORDER BY nome', (err, categorias) => {
-        if (err) {
-            return res.status(500).json({ erro: 'Erro interno do servidor' });
-        }
-        res.json(categorias);
-    });
+app.get('/api/categorias', async (req, res) => {
+    try {
+        const result = await query('SELECT * FROM categorias ORDER BY nome');
+        res.json(result.rows);
+    } catch (error) {
+        console.error('Erro ao buscar categorias:', error);
+        res.status(500).json({ erro: 'Erro interno do servidor' });
+    }
 });
 
 // Verificar status de login
@@ -285,20 +311,22 @@ app.get('/api/status', (req, res) => {
 
 // ==================== INICIAR SERVIDOR ====================
 
-app.listen(PORT, () => {
-    console.log(`🚀 Servidor rodando em http://localhost:${PORT}`);
-    console.log('📝 Para parar o servidor: Ctrl + C');
+// Inicializar banco e servidor
+inicializarBanco().then(() => {
+    app.listen(PORT, () => {
+        console.log(`🚀 Servidor rodando em http://localhost:${PORT}`);
+        console.log('📝 Para parar o servidor: Ctrl + C');
+    });
 });
 
-// Fechar banco ao encerrar aplicação
-process.on('SIGINT', () => {
+// Fechar pool ao encerrar aplicação
+process.on('SIGINT', async () => {
     console.log('\n🔄 Encerrando servidor...');
-    db.close((err) => {
-        if (err) {
-            console.error('Erro ao fechar banco:', err.message);
-        } else {
-            console.log('✅ Banco fechado');
-        }
-        process.exit(0);
-    });
+    try {
+        await pool.end();
+        console.log('✅ Pool PostgreSQL fechado');
+    } catch (error) {
+        console.error('Erro ao fechar pool:', error);
+    }
+    process.exit(0);
 });
